@@ -1,0 +1,4 @@
+streamlit
+edge-tts
+pypdf
+pymupdf
