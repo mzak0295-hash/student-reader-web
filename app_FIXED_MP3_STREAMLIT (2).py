@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import re
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -12,18 +13,9 @@ import streamlit as st
 from pypdf import PdfReader
 
 try:
-    import fitz  # PyMuPDF
+    import fitz
 except ImportError:
     fitz = None
-
-try:
-    import pytesseract
-    from PIL import Image, ImageOps, ImageFilter
-except ImportError:
-    pytesseract = None
-    Image = None
-    ImageOps = None
-    ImageFilter = None
 
 VOICE = "ar-EG-SalmaNeural"
 
@@ -31,150 +23,102 @@ VOICE = "ar-EG-SalmaNeural"
 def clean_extracted_text(text):
     if not text:
         return ""
-
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
-
-    def bare(s):
-        return re.sub(
-            r"^[،؛,:.!؟()\[\]{}\"'«»]+|[،؛,:.!؟()\[\]{}\"'«»]+$",
-            "",
-            s,
-        ).strip()
-
-    def norm(s):
-        return re.sub(r"\s+", " ", s).strip()
-
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    unique_lines = []
+    unique = []
     for line in lines:
-        if unique_lines and norm(line) == norm(unique_lines[-1]):
+        if unique and re.sub(r"\s+", " ", line) == re.sub(r"\s+", " ", unique[-1]):
             continue
-        unique_lines.append(line)
-
-    fixed_lines = []
-    for line in unique_lines:
-        words = line.split()
-        fixed = []
-        for word in words:
-            if fixed and bare(word) and bare(word) == bare(fixed[-1]):
-                continue
-            fixed.append(word)
-        line2 = " ".join(fixed).strip()
-        if line2:
-            fixed_lines.append(line2)
-
-    text = "\n".join(fixed_lines).strip()
-
-    words = text.replace("\n", " ").split()
-    if len(words) >= 6:
-        cleaned_words = []
-        i = 0
-        n = len(words)
-        while i < n:
-            found = False
-            max_len = min(80, (n - i) // 2)
-            for length in range(max_len, 2, -1):
-                first = [bare(w) for w in words[i:i + length]]
-                second = [bare(w) for w in words[i + length:i + 2 * length]]
-                if first == second:
-                    cleaned_words.extend(words[i:i + length])
-                    i += 2 * length
-                    found = True
-                    break
-            if not found:
-                cleaned_words.append(words[i])
-                i += 1
-        text = " ".join(cleaned_words).strip()
-
+        unique.append(line)
+    text = "\n".join(unique).strip()
     text = re.sub(r"[ \t]+", " ", text)
-    for _ in range(5):
-        changed = False
-        for length in range(180, 5, -1):
-            pattern = re.compile(r"(.{" + str(length) + r"})(?:\1)", re.DOTALL)
-            new_text, count = pattern.subn(r"\1", text)
-            if count:
-                text = new_text
-                changed = True
-                break
-        if not changed:
-            break
-
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r" *\n *", "\n", text)
     return text.strip()
 
 
 def ocr_page(page):
-    """OCR عربي للصفحة فقط عندما لا يتوفر نص قابل للاستخراج."""
-    if fitz is None or pytesseract is None or Image is None:
+    if fitz is None:
         return ""
-
+    image_path = None
     try:
-        # 180 DPI: دقة جيدة للعربية مع استهلاك معقول للذاكرة والوقت.
-        pix = page.get_pixmap(matrix=fitz.Matrix(180 / 72, 180 / 72), alpha=False)
-        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        gray = ImageOps.grayscale(image)
-        gray = gray.filter(ImageFilter.SHARPEN)
-
-        text = pytesseract.image_to_string(
-            gray,
-            lang="ara",
-            config="--oem 1 --psm 6",
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(220 / 72, 220 / 72),
+            colorspace=fitz.csGRAY,
+            alpha=False,
         )
-        return clean_extracted_text(text)
-    except Exception:
-        return ""
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            image_path = tmp.name
+        pix.save(image_path)
+        best = ""
+        for psm in ("6", "3", "4"):
+            try:
+                result = subprocess.run(
+                    ["tesseract", image_path, "stdout", "-l", "ara", "--oem", "1", "--psm", psm],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=90,
+                )
+                candidate = clean_extracted_text(result.stdout or "")
+                if len(candidate) > len(best):
+                    best = candidate
+            except Exception:
+                pass
+            if len(best) >= 30:
+                break
+        if len(best) < 8:
+            try:
+                textpage = page.get_textpage_ocr(language="ara", dpi=220, full=True)
+                best = max(best, clean_extracted_text(page.get_text("text", textpage=textpage) or ""), key=len)
+            except Exception:
+                pass
+        return best
+    finally:
+        if image_path:
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
 
 
 def extract_page_texts(pdf_bytes):
-    """استخراج النص بأكثر من محرك، ثم OCR عربي للصفحات التي بقيت فارغة."""
-    texts = []
-
-    pypdf_reader = None
+    reader = None
     try:
-        pypdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+        reader = PdfReader(io.BytesIO(pdf_bytes))
     except Exception:
         pass
-
     doc = None
     if fitz is not None:
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         except Exception:
-            doc = None
-
-    if pypdf_reader is not None:
-        total = len(pypdf_reader.pages)
+            pass
+    if reader is not None:
+        total = len(reader.pages)
     elif doc is not None:
         total = len(doc)
     else:
         raise RuntimeError("تعذر فتح ملف PDF")
-
+    texts = []
     for i in range(total):
         candidates = []
-
         if doc is not None:
             try:
                 candidates.append(doc.load_page(i).get_text("text", sort=True) or "")
             except Exception:
                 pass
-
-        if pypdf_reader is not None:
+        if reader is not None:
             try:
-                candidates.append(pypdf_reader.pages[i].extract_text() or "")
+                candidates.append(reader.pages[i].extract_text() or "")
             except Exception:
                 pass
-
         cleaned = [clean_extracted_text(x) for x in candidates]
         text = max(cleaned, key=len) if cleaned else ""
-
-        # إذا كانت الصفحة صورة ممسوحة ضوئيًا، لا نتخطاها: نستخدم OCR العربي.
-        if len(text.strip()) < 8 and doc is not None:
+        if len(text) < 8 and doc is not None:
             text = ocr_page(doc.load_page(i))
-
         texts.append(text)
-
     if doc is not None:
         doc.close()
     return texts
@@ -185,15 +129,11 @@ async def make_audio(text):
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             temp_path = tmp.name
-
-        communicate = edge_tts.Communicate(text, VOICE)
-        await communicate.save(temp_path)
-
+        await edge_tts.Communicate(text, VOICE).save(temp_path)
         if not os.path.isfile(temp_path) or os.path.getsize(temp_path) < 1024:
             raise RuntimeError("لم يتم إنشاء ملف MP3 صالح")
-
-        with open(temp_path, "rb") as audio_file:
-            return audio_file.read()
+        with open(temp_path, "rb") as f:
+            return f.read()
     finally:
         if temp_path:
             try:
@@ -203,20 +143,16 @@ async def make_audio(text):
 
 
 def convert_pdf(uploaded_file, progress=None):
-    pdf_bytes = uploaded_file.getvalue()
-    texts = extract_page_texts(pdf_bytes)
+    texts = extract_page_texts(uploaded_file.getvalue())
     total = len(texts)
     audio_files = []
-    skipped_pages = []
-
-    for page_number, text in enumerate(texts, start=1):
+    unreadable_pages = []
+    for page_number, text in enumerate(texts, 1):
         if progress:
             progress(page_number, total, "تحضير الصفحة")
-
         if not text:
-            skipped_pages.append(page_number)
-            continue
-
+            text = f"الصفحة {page_number}. تعذر استخراج النص المقروء من هذه الصفحة آليًا."
+            unreadable_pages.append(page_number)
         data = None
         for attempt in range(3):
             try:
@@ -225,129 +161,53 @@ def convert_pdf(uploaded_file, progress=None):
             except Exception:
                 if attempt < 2:
                     time.sleep(1.5)
-
         if data is not None:
             audio_files.append((f"صفحة_{page_number:04d}.mp3", data))
         else:
-            skipped_pages.append(page_number)
-
+            unreadable_pages.append(page_number)
         if progress:
             progress(page_number, total, "تحويل الصفحة")
-
-    return total, audio_files, skipped_pages
-
-
-def make_zip(book_name, audio_files):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        for filename, data in audio_files:
-            z.writestr(f"{book_name}_صوتي/{filename}", data)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return total, audio_files, sorted(set(unreadable_pages))
 
 
-st.set_page_config(
-    page_title="القارئ التعليمي للطلاب المكفوفين",
-    page_icon="🔊",
-    layout="centered",
-)
-
-st.markdown(
-    """
-    <style>
-    html, body, [class*="css"] { direction: rtl; }
-    .big-title { font-size: 2rem; font-weight: 800; text-align: center; }
-    .sub-title { text-align: center; font-size: 1.1rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
+st.set_page_config(page_title="القارئ التعليمي للطلاب المكفوفين", page_icon="🔊", layout="centered")
+st.markdown("<style>html,body,[class*=\"css\"]{direction:rtl}.big-title{font-size:2rem;font-weight:800;text-align:center}.sub-title{text-align:center;font-size:1.1rem}</style>", unsafe_allow_html=True)
 st.markdown('<div class="big-title">🔊 القارئ التعليمي للطلاب المكفوفين</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">تحويل الكتب التعليمية PDF إلى ملفات صوتية عربية</div>', unsafe_allow_html=True)
-
-st.info(
-    "نسخة محسنة: تستخدم استخراج النص من أكثر من محرك، وتستخدم OCR عربي تلقائيًا "
-    "للصفحات المصورة أو الصفحات التي لا يظهر منها نص."
-)
-
-mode = st.radio(
-    "طريقة الاستخدام",
-    ["تحويل كتاب واحد", "تحويل عدة كتب دفعة واحدة"],
-    horizontal=False,
-)
-
-if mode == "تحويل كتاب واحد":
-    files = st.file_uploader(
-        "📚 اختر كتاب PDF",
-        type=["pdf"],
-        accept_multiple_files=False,
-    )
-else:
-    files = st.file_uploader(
-        "📚 اختر الكتب PDF التي تريد تحويلها",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="يمكن تحديد عدة كتب من الهاتف أو الكمبيوتر.",
-    )
-
+st.info("نسخة نهائية محسنة: استخراج النص + OCR عربي مباشر للصفحات المصورة، مع إنشاء ملف صوتي لكل صفحة.")
+mode = st.radio("طريقة الاستخدام", ["تحويل كتاب واحد", "تحويل عدة كتب دفعة واحدة"], horizontal=False)
+files = st.file_uploader("📚 اختر كتاب PDF" if mode == "تحويل كتاب واحد" else "📚 اختر الكتب PDF التي تريد تحويلها", type=["pdf"], accept_multiple_files=(mode != "تحويل كتاب واحد"))
 if files:
     if not isinstance(files, list):
         files = [files]
-
     st.write(f"**عدد الكتب المختارة: {len(files)}**")
-
     if st.button("🔊 بدء تحويل الكتب إلى صوت", type="primary", use_container_width=True):
         all_results = []
         overall = st.progress(0)
         status = st.empty()
-
-        for book_index, uploaded in enumerate(files, start=1):
+        for book_index, uploaded in enumerate(files, 1):
             book_name = Path(uploaded.name).stem
-            status.write(f"جاري تحويل الكتاب {book_index} من {len(files)}: **{uploaded.name}**")
             page_progress = st.progress(0)
-
             def update_page(page, total, stage):
                 page_progress.progress(page / max(total, 1))
-                status.write(
-                    f"الكتاب {book_index}/{len(files)} — {book_name} — "
-                    f"الصفحة {page}/{total} — {stage}"
-                )
-
+                status.write(f"الكتاب {book_index}/{len(files)} — {book_name} — الصفحة {page}/{total} — {stage}")
             try:
-                total, audio_files, skipped_pages = convert_pdf(uploaded, update_page)
-                all_results.append((book_name, audio_files, total, skipped_pages))
+                total, audio_files, unreadable = convert_pdf(uploaded, update_page)
+                all_results.append((book_name, audio_files, total, unreadable))
             except Exception as e:
                 st.error(f"تعذر تحويل {uploaded.name}: {e}")
-
             overall.progress(book_index / len(files))
-
         if all_results:
             final_buffer = io.BytesIO()
             with zipfile.ZipFile(final_buffer, "w", zipfile.ZIP_DEFLATED) as z:
                 for book_name, audio_files, _, _ in all_results:
                     for filename, data in audio_files:
                         z.writestr(f"{book_name}_صوتي/{filename}", data)
-
-            final_buffer.seek(0)
             st.success("✅ اكتمل التحويل.")
-
-            for book_name, audio_files, total, skipped_pages in all_results:
-                if skipped_pages:
-                    st.warning(
-                        f"{book_name} — {len(audio_files)} صفحة صوتية من {total}. "
-                        f"الصفحات التي تعذر تحويلها: {', '.join(map(str, skipped_pages))}"
-                    )
+            for book_name, audio_files, total, unreadable in all_results:
+                if unreadable:
+                    st.warning(f"{book_name} — تم إنشاء {len(audio_files)} ملفًا صوتيًا من {total}. الصفحات التي لم يُستخرج نصها: {', '.join(map(str, unreadable))}")
                 else:
                     st.success(f"{book_name} — تم تحويل جميع الصفحات {total}/{total} بنجاح ✅")
-
-            st.download_button(
-                "⬇️ تنزيل الملفات الصوتية",
-                data=final_buffer.getvalue(),
-                file_name="الكتب_الصوتية.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-            )
-
+            st.download_button("⬇️ تنزيل الملفات الصوتية", data=final_buffer.getvalue(), file_name="الكتب_الصوتية.zip", mime="application/zip", type="primary", use_container_width=True)
 st.caption("الصوت المستخدم: ar-EG-SalmaNeural — نفس الصوت العربي الموجود في النسخة الأصلية.")
